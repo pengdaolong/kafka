@@ -53,13 +53,13 @@ import scala.math._
  * @param time The time instance
  */
 @nonthreadsafe
-class LogSegment private[log] (val log: FileRecords,
-                               val lazyOffsetIndex: LazyIndex[OffsetIndex],
-                               val lazyTimeIndex: LazyIndex[TimeIndex],
-                               val txnIndex: TransactionIndex,
-                               val baseOffset: Long,
-                               val indexIntervalBytes: Int,
-                               val rollJitterMs: Long,
+class LogSegment private[log] (val log: FileRecords,//消息日志文件
+                               val lazyOffsetIndex: LazyIndex[OffsetIndex],//位移索引文件
+                               val lazyTimeIndex: LazyIndex[TimeIndex],//时间戳索引文件
+                               val txnIndex: TransactionIndex,//事务索引
+                               val baseOffset: Long,//就是文件名上的偏移量 是该文件的最小偏移量
+                               val indexIntervalBytes: Int,//一般默认是4k log.index.interval.bytes 大于时就新增一一条索引项
+                               val rollJitterMs: Long,//扰动值 某事件创建多个日志对象 极大的增加磁盘io压力 通过这个让每个日志对象岔开 缓解io瓶颈
                                val time: Time) extends Logging {
 
   def offsetIndex: OffsetIndex = lazyOffsetIndex.get
@@ -118,6 +118,7 @@ class LogSegment private[log] (val log: FileRecords,
   }
 
   /* Return the size in bytes of this log segment */
+  //该日志段的字节大小
   def size: Int = log.sizeInBytes()
 
   /**
@@ -141,30 +142,37 @@ class LogSegment private[log] (val log: FileRecords,
    * @throws LogSegmentOffsetOverflowException if the largest offset causes index offset overflow
    */
   @nonthreadsafe
-  def append(largestOffset: Long,
-             largestTimestamp: Long,
-             shallowOffsetOfMaxTimestamp: Long,
-             records: MemoryRecords): Unit = {
+  def append(largestOffset: Long,//最大位移值
+             largestTimestamp: Long,//最大时间戳
+             shallowOffsetOfMaxTimestamp: Long,//最大时间戳对应消息的位移
+             records: MemoryRecords//要写入的消息集合
+            ): Unit = {
     if (records.sizeInBytes > 0) {
       trace(s"Inserting ${records.sizeInBytes} bytes at end offset $largestOffset at position ${log.sizeInBytes} " +
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
+      //得到日志的物理位置
       val physicalPosition = log.sizeInBytes()
       if (physicalPosition == 0)
         rollingBasedTimestamp = Some(largestTimestamp)
-
+      // 0< largestOffset - baseoffset <INt.maxValue 就是正确的 否则报错
       ensureOffsetInRange(largestOffset)
 
-      // append the messages
+      // append the messages  写了数据之后返回写了多少字节
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
       // Update the in memory max timestamp and corresponding offset.
+      //maxTimestampSoFar 时间戳索引文件  timeIndex.lastEntry.timestamp
+      //val lazyTimeIndex: LazyIndex[TimeIndex],//时间戳索引文件 这个数组的最后一个的时间戳
+      //shallowOffsetOfMaxTimestamp 最大时间戳对应消息的位移
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampSoFar = largestTimestamp
         offsetOfMaxTimestampSoFar = shallowOffsetOfMaxTimestamp
       }
       // append an entry to the index (if needed)
+      //生成索引文件
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
         offsetIndex.append(largestOffset, physicalPosition)
+        //最大位移和最大时间戳
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
         bytesSinceLastIndexEntry = 0
       }
