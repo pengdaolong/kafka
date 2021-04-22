@@ -140,7 +140,7 @@ public class FileRecords extends AbstractRecords implements Closeable {
 
         if (position < 0)
             throw new IllegalArgumentException("Invalid position: " + position + " in read from " + this);
-        if (position > currentSizeInBytes - start)
+        if (position > currentSizeInBytes - start)//position 不是偏移量 是物理位置信息
             throw new IllegalArgumentException("Slice from position " + position + " exceeds end position of " + this);
         if (size < 0)
             throw new IllegalArgumentException("Invalid size: " + size + " in read from " + this);
@@ -461,9 +461,9 @@ public class FileRecords extends AbstractRecords implements Closeable {
     }
 
     public static class LogOffsetPosition {
-        public final long offset;
-        public final int position;
-        public final int size;
+        public final long offset;//偏移量
+        public final int position;//物理位置信息
+        public final int size;//处于多少个byte的位置
 
         public LogOffsetPosition(long offset, int position, int size) {
             this.offset = offset;

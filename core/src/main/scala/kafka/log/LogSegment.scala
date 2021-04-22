@@ -296,13 +296,15 @@ class LogSegment private[log] (val log: FileRecords,//消息日志文件
    *         or null if the startOffset is larger than the largest offset in this log
    */
   @threadsafe
-  def read(startOffset: Long,
-           maxSize: Int,
-           maxPosition: Long = size,
-           minOneMessage: Boolean = false): FetchDataInfo = {
+  def read(startOffset: Long,//开始偏移量
+           maxSize: Int,//读取最大的字节数
+           maxPosition: Long = size,//读取的最大文件位置
+           minOneMessage: Boolean = false//如果为true 即使大于最大位移值 也返回第一条数据  避免消费饿死
+          ): FetchDataInfo = {
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
+    //找到>=startOffset的位置 找到对应的物理文件位置  不存在返回null startoffset 200byte
     val startOffsetAndSize = translateOffset(startOffset)
 
     // if the start position is already off the end of the log, return null
@@ -312,15 +314,17 @@ class LogSegment private[log] (val log: FileRecords,//消息日志文件
     val startPosition = startOffsetAndSize.position
     val offsetMetadata = LogOffsetMetadata(startOffset, this.baseOffset, startPosition)
 
+    //maxSize有可能为0  startOffsetAndSize.size 为第一条数据的大小 开始偏移量的位置信息 LogOffsetPosition
     val adjustedMaxSize =
       if (minOneMessage) math.max(maxSize, startOffsetAndSize.size)
       else maxSize
 
     // return a log segment but with zero size in the case below
-    if (adjustedMaxSize == 0)
+    if (adjustedMaxSize == 0)//返回空的FetchDataInfo
       return FetchDataInfo(offsetMetadata, MemoryRecords.EMPTY)
 
     // calculate the length of the message set to read based on whether or not they gave us a maxOffset
+    //最大-开始=能读多少字节 跟传入参数maxSize 比较 只能读较小的 300-280=20 < 100  只能读20byte
     val fetchSize: Int = min((maxPosition - startPosition).toInt, adjustedMaxSize)
 
     FetchDataInfo(offsetMetadata, log.slice(startPosition, fetchSize),
