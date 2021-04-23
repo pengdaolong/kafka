@@ -348,17 +348,18 @@ class LogSegment private[log] (val log: FileRecords,//消息日志文件
   def recover(producerStateManager: ProducerStateManager, leaderEpochCache: Option[LeaderEpochFileCache] = None): Int = {
     offsetIndex.reset()
     timeIndex.reset()
-    txnIndex.reset()
-    var validBytes = 0
-    var lastIndexEntry = 0
-    maxTimestampSoFar = RecordBatch.NO_TIMESTAMP
+    txnIndex.reset()//将索引信息清空
+    var validBytes = 0 //重置字节数
+    var lastIndexEntry = 0//重置索引记录
+    maxTimestampSoFar = RecordBatch.NO_TIMESTAMP//重置最大时间戳
     try {
+      //该日志段下所有的信息
       for (batch <- log.batches.asScala) {
         batch.ensureValid()
-        ensureOffsetInRange(batch.lastOffset)
+        ensureOffsetInRange(batch.lastOffset)// 0< lastOffset < Int.MaxValue 校验该批次 最末偏移量是否符合要求
 
         // The max timestamp is exposed at the batch level, so no need to iterate the records
-        if (batch.maxTimestamp > maxTimestampSoFar) {
+        if (batch.maxTimestamp > maxTimestampSoFar) {//更新最大时间戳和对应的消息位移，后序用于时间戳索引
           maxTimestampSoFar = batch.maxTimestamp
           offsetOfMaxTimestampSoFar = batch.lastOffset
         }
