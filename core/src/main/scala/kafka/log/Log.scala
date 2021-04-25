@@ -316,7 +316,7 @@ class Log(@volatile var dir: File,
     info(s"Completed load of log with ${segments.size} segments, log start offset $logStartOffset and " +
       s"log end offset $logEndOffset in ${time.milliseconds() - startMs} ms")
   }
-
+  //高水位
   def highWatermark: Long = highWatermarkMetadata.messageOffset
 
   /**
@@ -329,6 +329,7 @@ class Log(@volatile var dir: File,
    * @param hw the suggested new value for the high watermark
    * @return the updated high watermark offset
    */
+  //更新hw follower副本从Leader副本获取到消息后更新高水位值。一旦拿到新得消息，就必须要更新高水位值
   def updateHighWatermark(hw: Long): Long = {
     val newHighWatermark = if (hw < logStartOffset)
       logStartOffset
@@ -349,8 +350,10 @@ class Log(@volatile var dir: File,
    *
    * @return the old high watermark, if updated by the new value
    */
+  //可能更新hw 用于更新Leader副本高水位值 新的日志段或者同一个日志段 新得水位线大于老的水位线
+  //producer端向leader端副本写入消息，分区的高水位值就可能不需要更新（可能需要等待其他follower副本同步）
   def maybeIncrementHighWatermark(newHighWatermark: LogOffsetMetadata): Option[LogOffsetMetadata] = {
-    if (newHighWatermark.messageOffset > logEndOffset)
+    if (newHighWatermark.messageOffset > logEndOffset)//不在一个日志段
       throw new IllegalArgumentException(s"High watermark $newHighWatermark update exceeds current " +
         s"log end offset $logEndOffsetMetadata")
 
@@ -359,6 +362,9 @@ class Log(@volatile var dir: File,
 
       // Ensure that the high watermark increases monotonically. We also update the high watermark when the new
       // offset metadata is on a newer segment, which occurs whenever the log is rolled to a new segment.
+      //
+      //老的小于新的 更新
+      //水位线一样 并且 新高水位值再新日志段上
       if (oldHighWatermark.messageOffset < newHighWatermark.messageOffset ||
         (oldHighWatermark.messageOffset == newHighWatermark.messageOffset && oldHighWatermark.onOlderSegment(newHighWatermark))) {
         updateHighWatermarkMetadata(newHighWatermark)
@@ -374,28 +380,28 @@ class Log(@volatile var dir: File,
    * known, this will do a lookup in the index and cache the result.
    */
   private def fetchHighWatermarkMetadata: LogOffsetMetadata = {
-    checkIfMemoryMappedBufferClosed()
+    checkIfMemoryMappedBufferClosed()//日志通道是否关闭 true 报错
 
-    val offsetMetadata = highWatermarkMetadata
-    if (offsetMetadata.messageOffsetOnly) {
+    val offsetMetadata = highWatermarkMetadata //保存当前高水位值本地化，避免高并发影响
+    if (offsetMetadata.messageOffsetOnly) {//没有得到完整的元数据
       lock.synchronized {
-        val fullOffset = convertToOffsetMetadataOrThrow(highWatermark)
-        updateHighWatermarkMetadata(fullOffset)
+        val fullOffset = convertToOffsetMetadataOrThrow(highWatermark)//通过读取日志文件的方式把完整的高水位数据读出来
+        updateHighWatermarkMetadata(fullOffset)//更新元数据信息
         fullOffset
       }
-    } else {
+    } else { //有元数据信息 直接放回
       offsetMetadata
     }
   }
-
+//设置高水位值
   private def updateHighWatermarkMetadata(newHighWatermark: LogOffsetMetadata): Unit = {
     if (newHighWatermark.messageOffset < 0)
       throw new IllegalArgumentException("High watermark offset should be non-negative")
 
-    lock synchronized {
-      highWatermarkMetadata = newHighWatermark
-      producerStateManager.onHighWatermarkUpdated(newHighWatermark.messageOffset)
-      maybeIncrementFirstUnstableOffset()
+    lock synchronized {//保护log对象修改的Monitor锁
+      highWatermarkMetadata = newHighWatermark//更新高水位
+      producerStateManager.onHighWatermarkUpdated(newHighWatermark.messageOffset)// 处理事务状态管理器的高水位值更新逻辑 忽略
+      maybeIncrementFirstUnstableOffset() // First Unstable Offset是Kafka事务机制的一部分 忽略
     }
     trace(s"Setting high watermark $newHighWatermark")
   }
