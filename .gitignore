@@ -54,3 +54,5 @@ systest/
 clients/src/generated
 clients/src/generated-test
 streams/src/generated/
+
+gradle/wrapper/gradle-5.6.2-all.zip
