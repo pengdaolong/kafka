@@ -282,6 +282,10 @@ class Log(@volatile var dir: File,
   @volatile private var highWatermarkMetadata: LogOffsetMetadata = LogOffsetMetadata(logStartOffset)
 
   /* the actual segments of the log */
+  //线程安全 按key排序
+  // Kafka 将每个日志段的起始位移值作为 Key，这样一来，
+  // 我们就能够很方便地根据所有日志段的起始位移值对它们进行排序和比较，
+  // 同时还能快速地找到与给定位移值相近的前后两个日志段。
   private val segments: ConcurrentNavigableMap[java.lang.Long, LogSegment] = new ConcurrentSkipListMap[java.lang.Long, LogSegment]
 
   // Visible for testing
@@ -291,13 +295,15 @@ class Log(@volatile var dir: File,
     val startMs = time.milliseconds
 
     // create the log directory if it doesn't exist
+    //创建日志路径，保存log对象磁盘文件
     Files.createDirectories(dir.toPath)
-
+    //初始化leader epoch缓存
     initializeLeaderEpochCache()
-
+    //加载所有日志段对象，并返回该log对象下一条消息的位移值
     val nextOffset = loadSegments()
 
     /* Calculate the offset of the next message */
+    //
     nextOffsetMetadata = LogOffsetMetadata(nextOffset, activeSegment.baseOffset, activeSegment.size)
 
     leaderEpochCache.foreach(_.truncateFromEnd(nextOffsetMetadata.messageOffset))
@@ -1059,15 +1065,17 @@ class Log(@volatile var dir: File,
    * @throws UnexpectedAppendOffsetException If the first or last offset in append is less than next offset
    * @return Information about the appended messages including the first and last offset.
    */
-  private def append(records: MemoryRecords,
-                     origin: AppendOrigin,
+  private def append(records: MemoryRecords,//需要添加的消息
+                     origin: AppendOrigin,//声明会影响所需验证的附加内容来源
                      interBrokerProtocolVersion: ApiVersion,
                      assignOffsets: Boolean,
                      leaderEpoch: Int): LogAppendInfo = {
     maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
-      val appendInfo = analyzeAndValidateRecords(records, origin)
+      //分析和验证待写入数据（crc等），并将结果返回
+      val appendInfo:LogAppendInfo = analyzeAndValidateRecords(records, origin)
 
       // return if we have no valid messages or if this is a duplicate of the last appended entry
+      //如果 shallowConut == 0 则说明需要加入的消息为空 直接返回
       if (appendInfo.shallowCount == 0)
         return appendInfo
 
@@ -1076,11 +1084,12 @@ class Log(@volatile var dir: File,
 
       // they are valid, insert them in the log
       lock synchronized {
-        checkIfMemoryMappedBufferClosed()
+        checkIfMemoryMappedBufferClosed()//检查内存缓冲区是否关闭
         if (assignOffsets) {
+          // 分配偏移量
           // assign offsets to the message set
           val offset = new LongRef(nextOffsetMetadata.messageOffset)
-          appendInfo.firstOffset = Some(offset.value)
+          appendInfo.firstOffset = Some(offset.value)//需要添加的第一条消息的偏移量
           val now = time.milliseconds
           val validateAndOffsetAssignResult = try {
             LogValidator.validateMessagesAndAssignOffsets(validRecords,
@@ -1359,7 +1368,7 @@ class Log(@volatile var dir: File,
     var monotonic = true
     var maxTimestamp = RecordBatch.NO_TIMESTAMP
     var offsetOfMaxTimestamp = -1L
-    var readFirstMessage = false
+    var readFirstMessage = false //是否读取了第一条消息
     var lastOffsetOfFirstBatch = -1L
 
     for (batch <- records.batches.asScala) {
@@ -1389,8 +1398,9 @@ class Log(@volatile var dir: File,
       lastOffset = batch.lastOffset
 
       // Check if the message sizes are valid.
+      //这个批次的大小
       val batchSize = batch.sizeInBytes
-      if (batchSize > config.maxMessageSize) {
+      if (batchSize > config.maxMessageSize) {//max.message.bytes
         brokerTopicStats.topicStats(topicPartition.topic).bytesRejectedRate.mark(records.sizeInBytes)
         brokerTopicStats.allTopicsStats.bytesRejectedRate.mark(records.sizeInBytes)
         throw new RecordTooLargeException(s"The record batch size in the append to $topicPartition is $batchSize bytes " +
@@ -1398,19 +1408,22 @@ class Log(@volatile var dir: File,
       }
 
       // check the validity of the message by checking CRC
+      //CRC校验
       if (!batch.isValid) {
         brokerTopicStats.allTopicsStats.invalidMessageCrcRecordsPerSec.mark()
         throw new CorruptRecordException(s"Record is corrupt (stored crc = ${batch.checksum()}) in topic partition $topicPartition.")
       }
-
+      //更新最大时间戳和最大时间戳对应的偏移量
       if (batch.maxTimestamp > maxTimestamp) {
         maxTimestamp = batch.maxTimestamp
         offsetOfMaxTimestamp = lastOffset
       }
 
+      //把当前校验的数量和大小进行累加
       shallowMessageCount += 1
       validBytesCount += batchSize
 
+      //得到编解码器
       val messageCodec = CompressionCodec.getCompressionCodec(batch.compressionType.id)
       if (messageCodec != NoCompressionCodec)
         sourceCodec = messageCodec
@@ -1447,6 +1460,7 @@ class Log(@volatile var dir: File,
       records
     } else {
       // trim invalid bytes
+      //修剪无效字节
       val validByteBuffer = records.buffer.duplicate()
       validByteBuffer.limit(validBytes)
       MemoryRecords.readableRecords(validByteBuffer)
@@ -1710,7 +1724,7 @@ class Log(@volatile var dir: File,
    */
   private def deleteOldSegments(predicate: (LogSegment, Option[LogSegment]) => Boolean, reason: String): Int = {
     lock synchronized {
-      val deletable = deletableSegments(predicate)
+      val deletable = deletableSegments(predicate)//根据传入函数做相应计算
       if (deletable.nonEmpty)
         info(s"Found deletable segments with base offsets [${deletable.map(_.baseOffset).mkString(",")}] due to $reason")
       deleteSegments(deletable)
@@ -1722,13 +1736,14 @@ class Log(@volatile var dir: File,
       val numToDelete = deletable.size
       if (numToDelete > 0) {
         // we must always have at least one segment, so if we are going to delete all the segments, create a new one first
+        //如果要全部删除 就滚动日志 再执行删除
         if (segments.size == numToDelete)
           roll()
         lock synchronized {
           checkIfMemoryMappedBufferClosed()
           // remove the segments for lookups
-          removeAndDeleteSegments(deletable, asyncDelete = true)
-          maybeIncrementLogStartOffset(segments.firstEntry.getValue.baseOffset)
+          removeAndDeleteSegments(deletable, asyncDelete = true)//删除需要删除的日志段
+          maybeIncrementLogStartOffset(segments.firstEntry.getValue.baseOffset)//更新日志段信息
         }
       }
       numToDelete
@@ -1752,15 +1767,18 @@ class Log(@volatile var dir: File,
       Seq.empty
     } else {
       val deletable = ArrayBuffer.empty[LogSegment]
-      var segmentEntry = segments.firstEntry
+      var segmentEntry = segments.firstEntry//从最小起始位移值开始遍历
       while (segmentEntry != null) {
         val segment = segmentEntry.getValue
-        val nextSegmentEntry = segments.higherEntry(segmentEntry.getKey)
+        val nextSegmentEntry = segments.higherEntry(segmentEntry.getKey)//还有没有下一个日志段
         val (nextSegment, upperBoundOffset, isLastSegmentAndEmpty) = if (nextSegmentEntry != null)
           (nextSegmentEntry.getValue, nextSegmentEntry.getValue.baseOffset, false)
         else
           (null, logEndOffset, segment.size == 0)
 
+        // predicate =  (segment, _) => startMs - segment.largestTimestamp > config.retentionMs
+        //当前日志段最大偏移量或者下个日志段最小偏移量是否小于等于水位线
+        //是否是最后一个日志段 并且日志段为空
         if (highWatermark >= upperBoundOffset && predicate(segment, Option(nextSegment)) && !isLastSegmentAndEmpty) {
           deletable += segment
           segmentEntry = nextSegmentEntry
@@ -2349,7 +2367,7 @@ class Log(@volatile var dir: File,
    * Add the given segment to the segments in this log. If this segment replaces an existing segment, delete it.
    * @param segment The segment to add
    */
-  @threadsafe
+  @threadsafe//添加日志段
   def addSegment(segment: LogSegment): LogSegment = this.segments.put(segment.baseOffset, segment)
 
   private def maybeHandleIOException[T](msg: => String)(fun: => T): T = {
