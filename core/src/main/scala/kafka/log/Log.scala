@@ -1085,9 +1085,10 @@ class Log(@volatile var dir: File,
       // they are valid, insert them in the log
       lock synchronized {
         checkIfMemoryMappedBufferClosed()//检查内存缓冲区是否关闭
-        if (assignOffsets) {
+        if (assignOffsets) {//分配偏移量的是leader
           // 分配偏移量
           // assign offsets to the message set
+          // offset= 当前最大偏移量的下一个偏移量的地址
           val offset = new LongRef(nextOffsetMetadata.messageOffset)
           appendInfo.firstOffset = Some(offset.value)//需要添加的第一条消息的偏移量
           val now = time.milliseconds
@@ -1121,6 +1122,7 @@ class Log(@volatile var dir: File,
 
           // re-validate message sizes if there's a possibility that they have changed (due to re-compression or message
           // format conversion)
+          //消息大小如果改变了 看每个批次 是否符合标准
           if (validateAndOffsetAssignResult.messageSizeMaybeChanged) {
             for (batch <- validRecords.batches.asScala) {
               if (batch.sizeInBytes > config.maxMessageSize) {
@@ -1133,12 +1135,12 @@ class Log(@volatile var dir: File,
               }
             }
           }
-        } else {
+        } else {//这个是follower去同步leader数据
           // we are taking the offsets we are given
           if (!appendInfo.offsetsMonotonic)
             throw new OffsetsOutOfOrderException(s"Out of order offsets found in append to $topicPartition: " +
                                                  records.records.asScala.map(_.offset))
-
+          //第一个批次的 first offset 如果没有就是 last offset （如果 magic<2 的话 first offset 就会使null 就会得到last offset）
           if (appendInfo.firstOrLastOffsetOfFirstBatch < nextOffsetMetadata.messageOffset) {
             // we may still be able to recover if the log is empty
             // one example: fetching from log start offset on the leader which is not batch aligned,
