@@ -87,21 +87,23 @@ object LogAppendInfo {
  * @param offsetsMonotonic Are the offsets in this message set monotonically increasing
  * @param lastOffsetOfFirstBatch The last offset of the first batch
  */
-case class LogAppendInfo(var firstOffset: Option[Long],
-                         var lastOffset: Long,
-                         var maxTimestamp: Long,
-                         var offsetOfMaxTimestamp: Long,
-                         var logAppendTime: Long,
-                         var logStartOffset: Long,
-                         var recordConversionStats: RecordConversionStats,
-                         sourceCodec: CompressionCodec,
-                         targetCodec: CompressionCodec,
-                         shallowCount: Int,
-                         validBytes: Int,
-                         offsetsMonotonic: Boolean,
-                         lastOffsetOfFirstBatch: Long,
-                         recordErrors: List[RecordError] = List(),
-                         errorMessage: String = null) {
+//在 0.11.0.0 版本之后 lastOffset 和 lastOffsetOfFirstBatch 都是指向消息集合的最后一条消息即可
+case class LogAppendInfo(var firstOffset: Option[Long],//消息集合中得第一个偏移量，消息格式小于v2并且我们是追加到follower上
+                         var lastOffset: Long,//最后一条数据得偏移量
+                         var maxTimestamp: Long,//最大时间戳
+                         var offsetOfMaxTimestamp: Long,//具有最大时间戳得消息的偏移量
+                         var logAppendTime: Long,//日志写入时间
+                         var logStartOffset: Long,//消息集合首条消息的位移
+                         var recordConversionStats: RecordConversionStats,//消息转换统计类，里面记录了执行了格式转换的消息数等数据
+                         sourceCodec: CompressionCodec,//消息集合中消息使用的压缩器（Compressor）类型，比如是Snappy还是LZ4
+                         targetCodec: CompressionCodec,// 写入消息时需要使用的压缩器类型
+                         shallowCount: Int,//消息批次数，就是recodes.batchs 每个批次下有可能包含多条消息
+                         validBytes: Int,//写入消息总字节数
+                         offsetsMonotonic: Boolean,//消息位移值是顺序增加（单调递增）
+                         lastOffsetOfFirstBatch: Long,//第一个批次的中的最后一条消息的位移值
+                         recordErrors: List[RecordError] = List(),//写入消息时 错误的消息集合
+                         errorMessage: String = null//错误码
+                        ) {
   /**
    * Get the first offset if it exists, else get the last offset of the first batch
    * For magic versions 2 and newer, this method will return first offset. For magic versions
@@ -1191,6 +1193,7 @@ class Log(@volatile var dir: File,
 
         // now that we have valid records, offsets assigned, and timestamps updated, we need to
         // validate the idempotent/transactional state of the producers and collect some metadata
+        //验证事务状态
         val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(
           logOffsetMetadata, validRecords, origin)
 
@@ -1202,6 +1205,7 @@ class Log(@volatile var dir: File,
           return appendInfo
         }
 
+        //消息写入
         segment.append(largestOffset = appendInfo.lastOffset,
           largestTimestamp = appendInfo.maxTimestamp,
           shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
@@ -1213,9 +1217,12 @@ class Log(@volatile var dir: File,
         // will be cleaned up after the log directory is recovered. Note that the end offset of the
         // ProducerStateManager will not be updated and the last stable offset will not advance
         // if the append to the transaction index fails.
+        //更新log end offset leo值是消息集合中最后一条消息位移+1 leo值永远指向下一条不存在得消息
+        // nextOffsetMetadata 就是我们所说的 LEO
         updateLogEndOffset(appendInfo.lastOffset + 1)
 
         // update the producer state
+        //更新事务状态
         for (producerAppendInfo <- updatedProducers.values) {
           producerStateManager.update(producerAppendInfo)
         }
@@ -1239,10 +1246,12 @@ class Log(@volatile var dir: File,
           s"first offset: ${appendInfo.firstOffset}, " +
           s"next offset: ${nextOffsetMetadata.messageOffset}, " +
           s"and messages: $validRecords")
-
+        // 是否需要手动落盘。一般情况下我们不需要设置Broker端参数log.flush.interval.messages
+        // 落盘操作交由操作系统来完成。但某些情况下，可以设置该参数来确保高可靠性就会有损性能
         if (unflushedMessages >= config.flushInterval)
           flush()
 
+        //返回写入结果
         appendInfo
       }
     }
@@ -1375,6 +1384,7 @@ class Log(@volatile var dir: File,
 
     for (batch <- records.batches.asScala) {
       // we only validate V2 and higher to avoid potential compatibility issues with older clients
+      //目前是 0.11.0.0 版本引入的 Version 2 消息格式    消息格式是v2 起始位移值必须从0开始
       if (batch.magic >= RecordBatch.MAGIC_VALUE_V2 && origin == AppendOrigin.Client && batch.baseOffset != 0)
         throw new InvalidRecordException(s"The baseOffset of the record batch in the append to $topicPartition should " +
           s"be 0, but it is ${batch.baseOffset}")
@@ -1386,21 +1396,23 @@ class Log(@volatile var dir: File,
       // case, validation will be more lenient.
       // Also indicate whether we have the accurate first offset or not
       if (!readFirstMessage) {
-        if (batch.magic >= RecordBatch.MAGIC_VALUE_V2)
-          firstOffset = Some(batch.baseOffset)
-        lastOffsetOfFirstBatch = batch.lastOffset
+        if (batch.magic >= RecordBatch.MAGIC_VALUE_V2)//如果是v2
+          firstOffset = Some(batch.baseOffset)//更新 firstoffset
+        lastOffsetOfFirstBatch = batch.lastOffset//更新
         readFirstMessage = true
       }
 
       // check that offsets are monotonically increasing
+      //如果上个批次的lastoffset >= 当前批次lastOffset则说明不是单调递增
       if (lastOffset >= batch.lastOffset)
         monotonic = false
 
       // update the last offset seen
+      //当前批次最后位移值 更新 lastOffset 上面判断 是否单调递增
       lastOffset = batch.lastOffset
 
       // Check if the message sizes are valid.
-      //这个批次的大小
+      //这个批次的大小是否超过限制
       val batchSize = batch.sizeInBytes
       if (batchSize > config.maxMessageSize) {//max.message.bytes
         brokerTopicStats.topicStats(topicPartition.topic).bytesRejectedRate.mark(records.sizeInBytes)
@@ -1422,6 +1434,7 @@ class Log(@volatile var dir: File,
       }
 
       //把当前校验的数量和大小进行累加
+      //累加消息批次计数器以及有效字节数，更新shallowMessageCount字段
       shallowMessageCount += 1
       validBytesCount += batchSize
 
@@ -1432,7 +1445,10 @@ class Log(@volatile var dir: File,
     }
 
     // Apply broker-side compression if any
+    //获取Broker端设置的压缩器类型，即Broker端参数compression.type值。
+    //该参数默认值是producer，表示sourceCodec用的什么压缩器，targetCodec就用什么
     val targetCodec = BrokerCompressionCodec.getTargetCompressionCodec(config.compressionType, sourceCodec)
+    // 最后生成LogAppendInfo对象并返回
     LogAppendInfo(firstOffset, lastOffset, maxTimestamp, offsetOfMaxTimestamp, RecordBatch.NO_TIMESTAMP, logStartOffset,
       RecordConversionStats.EMPTY, sourceCodec, targetCodec, shallowMessageCount, validBytesCount, monotonic, lastOffsetOfFirstBatch)
   }
@@ -1490,10 +1506,11 @@ class Log(@volatile var dir: File,
    * @throws OffsetOutOfRangeException If startOffset is beyond the log end offset or before the log start offset
    * @return The fetch data information including fetch starting offset metadata and messages read.
    */
-  def read(startOffset: Long,
-           maxLength: Int,
-           isolation: FetchIsolation,
-           minOneMessage: Boolean): FetchDataInfo = {
+  def read(startOffset: Long,//开始读取位移值
+           maxLength: Int,//最多读多少字节
+           isolation: FetchIsolation,//设置读取隔离级别，主要控制能够读取的最大位移值，多用于 Kafka 事务
+           minOneMessage: Boolean): FetchDataInfo = {//是否允许最少读一条消息 如果一条消息是 100字节但是maxLength设置了50字节，
+                                                      // 正常情况下read方法永远无法返回任何消息，但是设置这个设置为true至少能返回一条消息
     maybeHandleIOException(s"Exception while reading from $topicPartition in dir ${dir.getParent}") {
       trace(s"Reading $maxLength bytes from offset $startOffset of length $size bytes")
 
