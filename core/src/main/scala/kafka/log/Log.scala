@@ -1518,23 +1518,31 @@ class Log(@volatile var dir: File,
 
       // Because we don't use the lock for reading, the synchronization is a little bit tricky.
       // We create the local variables to avoid race conditions with updates to the log.
-      val endOffsetMetadata = nextOffsetMetadata
+      val endOffsetMetadata = nextOffsetMetadata//nextoffsetMetadata赋值给局部变量 这样就不会因为nextoffsetMetadta变化
       val endOffset = endOffsetMetadata.messageOffset
-      var segmentEntry = segments.floorEntry(startOffset)
+      var segmentEntry = segments.floorEntry(startOffset)//返回小于或等于startoffset的值，没有为null
 
       // return error on attempt to read beyond the log end offset or read below log start offset
+      //开始偏移量大于当前最大偏移量
+      //segmentEntry == null 说明没有得到对应的segmentEntry 说明没有数据
+      // startoffset< logStartOffset说明当前日志不包含需要读的消息
       if (startOffset > endOffset || segmentEntry == null || startOffset < logStartOffset)
         throw new OffsetOutOfRangeException(s"Received request for offset $startOffset for partition $topicPartition, " +
           s"but we only have log segments in the range $logStartOffset to $endOffset.")
 
+      //查看读取隔离级别设置
+      //普通消费者 [log Start Offset ,LEO)之间 包左不包右
+      //事务型消费者只能看到[log start offset ,log Stable offset]之间的消息，  Log Stable Offset(LSO)是比LEO值小的位移值，为Kafka事务使用
+      //Follower 消费者只能看到[log start offset ,hw] 之间的消息
       val maxOffsetMetadata = isolation match {
         case FetchLogEnd => endOffsetMetadata
         case FetchHighWatermark => fetchHighWatermarkMetadata
         case FetchTxnCommitted => fetchLastStableOffsetMetadata
       }
 
-      if (startOffset == maxOffsetMetadata.messageOffset) {
+      if (startOffset == maxOffsetMetadata.messageOffset) {//刚好等于就返回这一条
         return emptyFetchDataInfo(maxOffsetMetadata, includeAbortedTxns)
+        //如果要读取的起始位置超过了能读取的最大位置，返回空的消息集合，因为没法读取任何消息
       } else if (startOffset > maxOffsetMetadata.messageOffset) {
         val startOffsetMetadata = convertToOffsetMetadataOrThrow(startOffset)
         return emptyFetchDataInfo(startOffsetMetadata, includeAbortedTxns)
@@ -1543,6 +1551,7 @@ class Log(@volatile var dir: File,
       // Do the read on the segment with a base offset less than the target offset
       // but if that segment doesn't contain any messages with an offset greater than that
       // continue to read from successive segments until we get some messages or we reach the end of the log
+      //遍历segment取到所需要的消息
       while (segmentEntry != null) {
         val segment = segmentEntry.getValue
 
@@ -1554,10 +1563,10 @@ class Log(@volatile var dir: File,
             segment.size
           }
         }
-
+        //读取消息
         val fetchInfo = segment.read(startOffset, maxLength, maxPosition, minOneMessage)
         if (fetchInfo == null) {
-          segmentEntry = segments.higherEntry(segmentEntry.getKey)
+          segmentEntry = segments.higherEntry(segmentEntry.getKey)//如果没有尝试读取更高得segment 没有就放回null 结束循环
         } else {
           return if (includeAbortedTxns)
             addAbortedTransactions(startOffset, segmentEntry, fetchInfo)
@@ -1569,6 +1578,7 @@ class Log(@volatile var dir: File,
       // okay we are beyond the end of the last segment with no data fetched although the start offset is in range,
       // this can happen when all messages with offset larger than start offsets have been deleted.
       // In this case, we will return the empty set with log end offset metadata
+      // 已经读到日志末尾还是没有数据返回，只能返回空消息集合
       FetchDataInfo(nextOffsetMetadata, MemoryRecords.EMPTY)
     }
   }
