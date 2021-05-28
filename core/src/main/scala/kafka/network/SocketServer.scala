@@ -497,6 +497,7 @@ private[kafka] abstract class AbstractServerThread(connectionQuotas: ConnectionQ
 /**
  * Thread that accepts and configures new connections. There is one of these per endpoint.
  */
+//接收和创建外部tcp连接的线程。每个socketServer实例只会创建一个Acceptor线程。它唯一的目的就是创建连接，将接收到的Request传递给下游的Processor线程处理
 private[kafka] class Acceptor(val endPoint: EndPoint,
                               val sendBufferSize: Int,
                               val recvBufferSize: Int,
@@ -687,6 +688,25 @@ private[kafka] object Processor {
  * Thread that processes all requests from a single connection. There are N of these running in parallel
  * each of which has its own selector
  */
+/**
+  * 这是处理单个TCP连接上所有请求的线程。每个socketServer默认创建若干个(num.network.threads)Processor线程。
+  * Processor线程负责将接收到的Request添加到RequestChannel的Request队列上，同事还负责将Response返还给Request发送方。
+  * @param id
+  * @param time
+  * @param maxRequestSize
+  * @param requestChannel
+  * @param connectionQuotas
+  * @param connectionsMaxIdleMs
+  * @param failedAuthenticationDelayMs
+  * @param listenerName
+  * @param securityProtocol
+  * @param config
+  * @param metrics
+  * @param credentialProvider
+  * @param memoryPool
+  * @param logContext
+  * @param connectionQueueSize
+  */
 private[kafka] class Processor(val id: Int,
                                time: Time,
                                maxRequestSize: Int,

@@ -39,12 +39,12 @@ public class RequestContext implements AuthorizableRequestContext {
     public final ListenerName listenerName;
     public final SecurityProtocol securityProtocol;
 
-    public RequestContext(RequestHeader header,
-                          String connectionId,
-                          InetAddress clientAddress,
-                          KafkaPrincipal principal,
-                          ListenerName listenerName,
-                          SecurityProtocol securityProtocol) {
+    public RequestContext(RequestHeader header,//请求头
+                          String connectionId,//request 发送方的tcp连接串表示 由Kafka根据一定规则定义，主要用于表示TCP连接
+                          InetAddress clientAddress,//发送方的ip
+                          KafkaPrincipal principal,//kafka用户认证，用于认证鉴权
+                          ListenerName listenerName,//监听器的名称 可以是预定于监听器（如PLAINTEXT） 也可以自定义
+                          SecurityProtocol securityProtocol) {// 安全协议类型，目前支持4种：PLAINTEXT、SSL、SASL_PLAINTEXT、SASL_SSL
         this.header = header;
         this.connectionId = connectionId;
         this.clientAddress = clientAddress;
@@ -53,17 +53,33 @@ public class RequestContext implements AuthorizableRequestContext {
         this.securityProtocol = securityProtocol;
     }
 
+    /**
+     * 从 bytebuffer 中提取对应的Request对象以及它的大小
+     *
+     *
+     * ！！！！！！！ apiVersion 请求的作用。broker 收到一个ApiVersionsRequest的时候，返回broker支持的请求类型列表，
+     * 包括请求类型名称、支持的最早版本号和最新版本号。kafka-broker-api-version.sh 就是构建ApiVersionsRequest对象 然后发送给broker
+     *
+     * 版本兼容的问题  kafka 必须保证版本号比最新支持版本还要高的请求也能被处理。客户端发送请求给broker的时候，不知道broker支持哪个版本，就要用ApiVersionRequest去获取
+     *
+     *
+     *
+     * @param buffer
+     * @return
+     */
     public RequestAndSize parseRequest(ByteBuffer buffer) {
-        if (isUnsupportedApiVersionsRequest()) {
+        if (isUnsupportedApiVersionsRequest()) {//从请求头中拿到信息判断是不是不支持的版本 是就不解析直接返回
             // Unsupported ApiVersion requests are treated as v0 requests and are not parsed
             ApiVersionsRequest apiVersionsRequest = new ApiVersionsRequest(new ApiVersionsRequestData(), (short) 0, header.apiVersion());
             return new RequestAndSize(apiVersionsRequest, 0);
         } else {
-            ApiKeys apiKey = header.apiKey();
+            ApiKeys apiKey = header.apiKey();//从RequestHeader获取到apikey
             try {
-                short apiVersion = header.apiVersion();
+                short apiVersion = header.apiVersion();//版本信息
+                //解释request
                 Struct struct = apiKey.parseRequest(apiVersion, buffer);
                 AbstractRequest body = AbstractRequest.parseRequest(apiKey, apiVersion, struct);
+                // 封装解析后的请求对象和大小
                 return new RequestAndSize(body, struct.sizeOf());
             } catch (Throwable ex) {
                 throw new InvalidRequestException("Error getting request for apiKey: " + apiKey +

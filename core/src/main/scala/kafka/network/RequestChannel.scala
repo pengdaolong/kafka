@@ -67,7 +67,25 @@ object RequestChannel extends Logging {
        metricsMap.values.foreach(_.removeMetrics())
     }
   }
-
+  /**
+    *num.network.threads 这个参数的更新模式是Cluster-wide. 这说明 kafka允许动态修改此参数值。
+    * broker启动时指定 为8 之后通过 kafka-configs修改为3.这个操作减少processor线程池中的线程数量。调用removeProcessor
+    *
+    * @param processor Processor 线程序号。这个请求时由哪个Processor线程接收处理的。
+    *                  broker端参数 num.network.threads 控制 broker每个监听器上创建的Processor线程数 默认是3
+    *                  PLAINTEXT://localhost:9092,SSL://localhost:9093 会有6个每3个一组 序号分别为 0 1 2
+    *                  当Request被后面的i/o线程处理完，还要依靠processor线程发送response给请求发送方，
+    *                  所以Request必须要记录它之前是被哪个processor线程接收的。
+    *                  Processor线程仅仅是网络接收线程，不会执行真正的Request请求处理逻辑，那是I/O线程负责的事。
+    * @param context 请求上下文信息
+    * @param startTimeNanos 记录request对象被创建得时间，主要用于各种时间统计指标的计算。 纳秒为单位 实现非常细粒度的时间统计精度
+    * @param memoryPool 表示源码定义的一个非阻塞式的内存缓冲区，主要作用是避免request对象无限使用内存。
+    *                   当前，该内存缓冲区的接口类和实现类，分别是 MemoryPool 和 SimpleMemoryPool。
+    *                   重点关注 SimpleMemoryPool 的 tryAllocate 方法，看看它是怎么为 Request 对象分配内存的。
+    * @param buffer buffer 是真正保存 Request 对象内容的字节缓冲区。Request 发送方必须按照 Kafka RPC 协议规定的格式向该缓冲区写入字节，否则将抛出 InvalidRequestException 异常。
+    *               这个逻辑主要是由 RequestContext 的 parseRequest 方法实现的。
+    * @param metrics  监控指标   放在map中
+    */
   class Request(val processor: Int,
                 val context: RequestContext,
                 val startTimeNanos: Long,
@@ -221,7 +239,7 @@ object RequestChannel extends Logging {
 
   }
 
-  abstract class Response(val request: Request) {
+  abstract class Response(val request: Request) {//包含Request
     locally {
       val nowNs = Time.SYSTEM.nanoseconds
       request.responseCompleteTimeNanos = nowNs
@@ -239,34 +257,35 @@ object RequestChannel extends Logging {
   }
 
   /** responseAsString should only be defined if request logging is enabled */
+  //大多数request请求完成后都需要回调
   class SendResponse(request: Request,
                      val responseSend: Send,
                      val responseAsString: Option[String],
                      val onCompleteCallback: Option[Send => Unit]) extends Response(request) {
     override def responseString: Option[String] = responseAsString
 
-    override def onComplete: Option[Send => Unit] = onCompleteCallback
+    override def onComplete: Option[Send => Unit] = onCompleteCallback//处理完成之后的回调逻辑
 
     override def toString: String =
       s"Response(type=Send, request=$request, send=$responseSend, asString=$responseAsString)"
   }
 
-  class NoOpResponse(request: Request) extends Response(request) {
+  class NoOpResponse(request: Request) extends Response(request) {//没有回调
     override def toString: String =
       s"Response(type=NoOp, request=$request)"
   }
 
-  class CloseConnectionResponse(request: Request) extends Response(request) {
+  class CloseConnectionResponse(request: Request) extends Response(request) {//出错后关闭tcp 显示的关闭
     override def toString: String =
       s"Response(type=CloseConnection, request=$request)"
   }
 
-  class StartThrottlingResponse(request: Request) extends Response(request) {
+  class StartThrottlingResponse(request: Request) extends Response(request) {//通知broker的socket server 某个tcp连接通信通道被限流
     override def toString: String =
       s"Response(type=StartThrottling, request=$request)"
   }
 
-  class EndThrottlingResponse(request: Request) extends Response(request) {
+  class EndThrottlingResponse(request: Request) extends Response(request) {//结束限流
     override def toString: String =
       s"Response(type=EndThrottling, request=$request)"
   }
@@ -275,7 +294,8 @@ object RequestChannel extends Logging {
 class RequestChannel(val queueSize: Int, val metricNamePrefix : String) extends KafkaMetricsGroup {
   import RequestChannel._
   val metrics = new RequestChannel.Metrics
-  private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)
+  //broker 启动时,SocketServer 组件会创建RequestChannel对象，并把queued.max.requests赋值给queueSize  默认 500
+  private val requestQueue = new ArrayBlockingQueue[BaseRequest](queueSize)//请求队列 线程安全 阻塞队列  queueSize是Request的最大长度
   private val processors = new ConcurrentHashMap[Int, Processor]()
   val requestQueueSizeMetricName = metricNamePrefix.concat(RequestQueueSizeMetric)
   val responseQueueSizeMetricName = metricNamePrefix.concat(ResponseQueueSizeMetric)
@@ -308,6 +328,7 @@ class RequestChannel(val queueSize: Int, val metricNamePrefix : String) extends 
   }
 
   /** Send a request to be handled, potentially blocking until there is room in the queue for the request */
+  //把request添加到arrayblockingQueue中
   def sendRequest(request: RequestChannel.Request): Unit = {
     requestQueue.put(request)
   }
@@ -331,10 +352,12 @@ class RequestChannel(val queueSize: Int, val metricNamePrefix : String) extends 
       trace(message)
     }
 
+    //得到response对应的processor线程，即request当初是由哪个Processor线程处理的
     val processor = processors.get(response.processor)
     // The processor may be null if it was shutdown. In this case, the connections
     // are closed, so the response is dropped.
     if (processor != null) {
+      //将response对象放到 对应Processor线程的response
       processor.enqueueResponse(response)
     }
   }
@@ -343,7 +366,7 @@ class RequestChannel(val queueSize: Int, val metricNamePrefix : String) extends 
   def receiveRequest(timeout: Long): RequestChannel.BaseRequest =
     requestQueue.poll(timeout, TimeUnit.MILLISECONDS)
 
-  /** Get the next request or block until there is one */
+  /** Get the next request or block until there is one */ //直到取到一个为止
   def receiveRequest(): RequestChannel.BaseRequest =
     requestQueue.take()
 
@@ -370,13 +393,24 @@ object RequestMetrics {
   val consumerFetchMetricName = ApiKeys.FETCH.name + "Consumer"
   val followFetchMetricName = ApiKeys.FETCH.name + "Follower"
 
-  val RequestsPerSec = "RequestsPerSec"
+  val RequestsPerSec = "RequestsPerSec" //每秒处理request数，评估broker繁忙状态
+  //计算request在Request队列中平均等待时间，单位毫秒。
+  //如果等待时间过长，增加后端I/O线程的数量 来加快队列request的拿取速度
   val RequestQueueTimeMs = "RequestQueueTimeMs"
+  //计算request实际被处理的时间，单位毫秒。一旦定位到这个监控项值很大，
+  // 需要进一步研究request被处理的逻辑，具体分析到底是哪一步消耗了过多时间
   val LocalTimeMs = "LocalTimeMs"
+  /**
+    * kafka的读写请求（produce请求和fetch请求）逻辑设计等待其他broker操作的步骤
+    * 非常重要！！！ kafka生成环境配置ack=all的producer程序发送消息延时高的主要原因，往往就是这个高。
+    */
   val RemoteTimeMs = "RemoteTimeMs"
   val ThrottleTimeMs = "ThrottleTimeMs"
   val ResponseQueueTimeMs = "ResponseQueueTimeMs"
   val ResponseSendTimeMs = "ResponseSendTimeMs"
+  /**
+    *计算request被处理的完整流程时间。 先看这个 这个有问题 再看前面的那几个。
+    */
   val TotalTimeMs = "TotalTimeMs"
   val RequestBytes = "RequestBytes"
   val MessageConversionsTimeMs = "MessageConversionsTimeMs"
