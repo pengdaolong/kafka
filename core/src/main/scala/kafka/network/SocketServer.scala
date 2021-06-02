@@ -72,6 +72,7 @@ import scala.util.control.ControlThrowable
  *      Acceptor has 1 Processor thread that has its own selector and read requests from the socket.
  *      1 Handler thread that handles requests and produce responses back to the processor thread for writing.
  */
+//对processor acceptor connectionQuotas tooManyConnectionsException 的管理和操作，
 class SocketServer(val config: KafkaConfig,
                    val metrics: Metrics,
                    val time: Time,
@@ -497,15 +498,23 @@ private[kafka] abstract class AbstractServerThread(connectionQuotas: ConnectionQ
 /**
  * Thread that accepts and configures new connections. There is one of these per endpoint.
  */
+/**
+  * ---------------------------!!!!!!!!!!!!!-------
+  * 如果Clients与Broker的网络延迟很大（如RTT>10ms）,建议调大控制缓冲区参数 sendBufferSize和recvBufferSize, 100k太小了
+  *
+  */
 //接收和创建外部tcp连接的线程。每个socketServer实例只会创建一个Acceptor线程。它唯一的目的就是创建连接，将接收到的Request传递给下游的Processor线程处理
-private[kafka] class Acceptor(val endPoint: EndPoint,
-                              val sendBufferSize: Int,
-                              val recvBufferSize: Int,
+private[kafka] class Acceptor(val endPoint: EndPoint,//broker端的连接信息
+                              val sendBufferSize: Int,//它设置的是SocketOption的SO_SNDNUF，及用于设置出站网络的I/O的底层缓冲区大小，socket.send.buffer.bytes 默认100KB。
+                              val recvBufferSize: Int,//它设置的是SocketOption的SO_REVBUF, 及用于设置入站网络的I/O的底层缓冲区大小，socket.receive.buffer.bytes 默认100KB。
                               brokerId: Int,
                               connectionQuotas: ConnectionQuotas,
                               metricPrefix: String) extends AbstractServerThread(connectionQuotas) with KafkaMetricsGroup {
-
+  //创建nio selector对象
+  //selector 对象负责执行底层实际I/O操作，如监听连接创建请求，读写请求等
   private val nioSelector = NSelector.open()
+  //Broker端创建对应的ServerSocketChannel实例
+  //后续把channel向上一步的selector对象注册
   val serverChannel = openServerSocket(endPoint.host, endPoint.port)
   private val processors = new ArrayBuffer[Processor]()
   private val processorsStarted = new AtomicBoolean
@@ -526,6 +535,8 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
 
   private def startProcessors(processors: Seq[Processor], processorThreadPrefix: String): Unit = synchronized {
     processors.foreach { processor =>
+      //data-plane-kafka-network-thread-0-ListenerName(PLAINTEXT)-PLAINTEXT-0
+      //                                                                   -1
       KafkaThread.nonDaemon(s"${processorThreadPrefix}-kafka-network-thread-$brokerId-${endPoint.listenerName}-${endPoint.securityProtocol}-${processor.id}",
         processor).start()
     }
@@ -1147,6 +1158,11 @@ private[kafka] class Processor(val id: Int,
 
 }
 
+/**
+  * 控制连接数配额的类。我们可以设置单个ip创建Broker连接的最大数量，以及单个broker能够能够允许的最大连接数
+  * @param config
+  * @param time
+  */
 class ConnectionQuotas(config: KafkaConfig, time: Time) extends Logging {
 
   @volatile private var defaultMaxConnectionsPerIp: Int = config.maxConnectionsPerIp
@@ -1307,5 +1323,5 @@ class ConnectionQuotas(config: KafkaConfig, time: Time) extends Logging {
     }
   }
 }
-
+//连接数额超配
 class TooManyConnectionsException(val ip: InetAddress, val count: Int) extends KafkaException(s"Too many connections from $ip (maximum = $count)")
