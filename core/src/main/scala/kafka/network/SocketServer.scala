@@ -546,7 +546,7 @@ private[kafka] class Acceptor(val endPoint: EndPoint,//broker端的连接信息
     // Shutdown `removeCount` processors. Remove them from the processor list first so that no more
     // connections are assigned. Shutdown the removed processors, closing the selector and its connections.
     // The processors are then removed from `requestChannel` and any pending responses to these processors are dropped.
-    val toRemove = processors.takeRight(removeCount)
+    val toRemove:ArrayBuffer[Processor] = processors.takeRight(removeCount)
     processors.remove(processors.size - removeCount, removeCount)
     toRemove.foreach(_.shutdown())
     toRemove.foreach(processor => requestChannel.removeProcessor(processor.id))
@@ -563,22 +563,25 @@ private[kafka] class Acceptor(val endPoint: EndPoint,//broker端的连接信息
    * Accept loop that checks for new connection attempts
    */
   def run(): Unit = {
+    //注册nioselector OP_ACCEPT事件
     serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+    //等待Acceptor线程启动完成
     startupComplete()
     try {
+      //当前使用的processor序号，从0开始 ，最大 num.network.threads -1
       var currentProcessorIndex = 0
       while (isRunning) {
         try {
-
+          //每500毫秒获取一次就绪I/O事件
           val ready = nioSelector.select(500)
           if (ready > 0) {
+            //如果I/O事件准备就绪
             val keys = nioSelector.selectedKeys()
             val iter = keys.iterator()
             while (iter.hasNext && isRunning) {
               try {
-                val key = iter.next
+                val key:SelectionKey = iter.next
                 iter.remove()
-
                 if (key.isAcceptable) {
                   accept(key).foreach { socketChannel =>
 
@@ -589,12 +592,14 @@ private[kafka] class Acceptor(val endPoint: EndPoint,//broker端的连接信息
                     var processor: Processor = null
                     do {
                       retriesLeft -= 1
+                      //计算出应该是由那个processor线程进行处理
                       processor = synchronized {
                         // adjust the index (if necessary) and retrieve the processor atomically for
                         // correct behaviour in case the number of processors is reduced dynamically
                         currentProcessorIndex = currentProcessorIndex % processors.length
                         processors(currentProcessorIndex)
                       }
+                      //更新当前Processor线程号
                       currentProcessorIndex += 1
                     } while (!assignNewConnection(socketChannel, processor, retriesLeft == 0))
                   }
@@ -614,7 +619,7 @@ private[kafka] class Acceptor(val endPoint: EndPoint,//broker端的连接信息
           case e: Throwable => error("Error occurred", e)
         }
       }
-    } finally {
+    } finally {//释放资源
       debug("Closing server socket and selector.")
       CoreUtils.swallow(serverChannel.close(), this, Level.ERROR)
       CoreUtils.swallow(nioSelector.close(), this, Level.ERROR)
